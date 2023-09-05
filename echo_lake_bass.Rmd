@@ -24,7 +24,7 @@ dist_from_wb_to_search = 10 # This number is in kilometers
 
 buffer_size_in_m = 50
 
-elevation_threshold = 10 # meters.
+elevation_threshold = 5 # meters.
 
 slope_threshold = 5 # this number is in degrees.
 
@@ -171,6 +171,224 @@ leaflet() |>
   addScaleBar('bottomright')
 ```
 
+### Downstream Waterbodies from `r focus_wb` {.tabset}
+
+#### Map of all Stream Direction Markers
+```{r}
+# Get stream direction points.
+stream_flow_dir = bcdc_query_geodata('freshwater-atlas-stream-directions') |>
+  filter(DWITHIN(focus_wb_poly, dist_from_wb_to_search, 'kilometers')) |> 
+  collect() |> 
+  dplyr::select(direction = DOWNSTREAM_DIRECTION)
+
+# Extend each stream direction point by 50 m in the direction of flow it indicates.
+# Add 50m hypoteneuse to each point, following its angle.
+flow_line_length = 100
+
+dat_for_flow_lines = stream_flow_dir |> 
+  mutate(direction_within_90 = direction %% 90) |> 
+  mutate(og_x = st_coordinates(geometry)[,1],
+         og_y = st_coordinates(geometry)[,2]) |> 
+  mutate(dir_rads = (direction * pi) / (180)) |> 
+  mutate(x_add = flow_line_length*cos(dir_rads),
+         y_add = flow_line_length*sin(dir_rads)) |> 
+  mutate(new_x = og_x + x_add,
+         new_y = og_y + y_add) |> 
+  st_drop_geometry() |> 
+  mutate(flow_id = row_number()) |> 
+  dplyr::select(flow_id,direction,og_x,new_x,og_y,new_y)
+
+flow_lines = tibble(
+  flow_id = rep(dat_for_flow_lines$flow_id,2)
+) |> 
+  group_by(flow_id) |> 
+  mutate(coord_id = paste0(flow_id,"-",row_number())) |> 
+  left_join(dat_for_flow_lines |> 
+              dplyr::select(flow_id,og_x,new_x) |> 
+              pivot_longer(-flow_id,values_to = 'X') |> 
+              dplyr::select(-name) |> 
+              group_by(flow_id) |> 
+              mutate(coord_id = paste0(flow_id,"-",row_number()))) |> 
+  left_join(dat_for_flow_lines |> 
+              dplyr::select(flow_id,og_y,new_y) |> 
+              pivot_longer(-flow_id,values_to = 'Y') |> 
+              dplyr::select(-name) |> 
+              group_by(flow_id) |> 
+              mutate(coord_id = paste0(flow_id,"-",row_number()))) |> 
+  ungroup() |> 
+  st_as_sf(coords = c("X","Y"), crs = 3005) |> 
+  arrange(flow_id, coord_id) |> 
+  group_by(flow_id) %>%
+  dplyr::summarize(do_union=FALSE) %>%  # do_union=FALSE doesn't work as well
+  st_cast("LINESTRING")
+
+# Find the nearest flow markers within 10 meters of our focus wb.
+nearby_stream_flow_lines = flow_lines[unlist(st_is_within_distance(focus_wb_poly, flow_lines, dist = 10)),]
+
+# Snag the nearest waterbodies that are in physical contact with our focus wb.
+nearest_wbs = wbs[unlist(st_intersects(focus_wb_poly,wbs)),] |> 
+  filter(name != focus_wb | is.na(name)) |> 
+  summarise()
+
+# Combine our focus wb with the nearest waterbodies we found just above.
+demo_flow_wbs = bind_rows(
+  nearest_wbs |> mutate(id = 'inflows/outflows'),
+  focus_wb_poly |> dplyr::mutate(id = focus_wb) |> dplyr::select(id)
+)
+
+# Visualize source waterbody and its nearest flow arrows and connected waterbodies.
+ggplot() +
+  geom_sf(
+    aes(fill = id),
+    data = demo_flow_wbs
+  ) +
+  geom_sf(data = nearby_stream_flow_lines,
+          col = 'black',
+          arrow = arrow(length = unit(0.25, 'cm'))) + 
+  geom_point(
+    aes(x = X, y = Y),
+    col = 'black',
+    data = nearby_stream_flow_lines |> 
+      st_coordinates() |> 
+      as.data.frame() |> 
+      group_by(L1) |> 
+      slice(2)) +
+  geom_sf_text(
+    aes(label = id),
+    data = demo_flow_wbs |> filter(id == focus_wb)
+  ) +
+  scale_fill_brewer(palette = 'Set2') + 
+  labs(fill = '',
+       title = 'Flow Direction of connected waterbodies',
+       subtitle = '(inflows and outflows)') + 
+  ggthemes::theme_map()
+```
+
+```{r}
+# Keep this running until something causes us to escape the loop.
+for(i in 1:17){
+  
+  if(interactive()) print(i)
+  
+  if(i == 1){
+    # Initialize the flow seed if i == 1.
+    flow_seed = focus_wb_poly |> 
+      mutate(name = 'flow_seed') |> 
+      dplyr::select(name)
+    
+    wb_pool_to_draw_from = wbs
+    
+    flow_lines_to_draw_from = flow_lines
+  }
+  
+  # Snag the nearest waterbodies that are in physical contact with a 50m buffer of our focus wb.
+  nearest_wbs = wb_pool_to_draw_from[unlist(st_intersects(st_buffer(flow_seed,20),wb_pool_to_draw_from)),] |> 
+    filter(!name %in% c(focus_wb,'flow_seed') | is.na(name)) |> 
+    mutate(row_id = row_number())
+  
+  # No more wbs that are touching our 
+  if(nrow(nearest_wbs)){break}
+  
+  # And remove these nearest waterbodies from our table of waterbodies to draw from...
+  wb_pool_to_draw_from = wb_pool_to_draw_from[-unlist(st_intersects(flow_seed,wb_pool_to_draw_from)),]
+  
+  # Are there any lakes in the nearest_wbs? If so, 
+  # we need to elide any streams that act as lake
+  # skeletons.
+  if('lake' %in% nearest_wbs$polytype){
+    # Remove any waterbodies (usually streams that are 
+    # 'lake skeletons') that are completely enveloped
+    # by lakes / rivers.
+    wbs_after_difference = nearest_wbs[0,]
+    
+    for(z in 1:nrow(nearest_wbs)){
+      
+      if(nearest_wbs[z,]$polytype == 'lake'){
+        wb_difference_with_other_wbs = nearest_wbs[z,]
+      } else {
+        wb_difference_with_other_wbs = st_difference(nearest_wbs[z,], nearest_wbs |> filter(polytype == 'lake')) |> 
+          summarise()
+      }
+      
+      # If the area of the resulting waterbody after taking the difference from 
+      # all other rows, can probably drop this wb.
+      if(as.numeric(st_area(wb_difference_with_other_wbs)) < 100){
+        return(next)
+      } else {
+        wbs_after_difference = bind_rows(wbs_after_difference,nearest_wbs[z,])
+      }
+    }
+  } else {
+    wbs_after_difference = nearest_wbs
+  }
+  
+  # Find the nearest flow markers within 10 meters of our focus wb.
+  nearest_flow_markers = flow_lines_to_draw_from[unlist(st_is_within_distance(flow_seed, flow_lines_to_draw_from, dist = 10)),]
+  
+  # Remove these nearest flow markers from the list of flow markers to search in subsequent model iterations.
+  flow_lines_to_draw_from = flow_lines_to_draw_from[-unlist(st_is_within_distance(flow_seed, flow_lines_to_draw_from, dist = 10)),]
+  
+  # Retain only flow lines whose start point fall within our flow_seed.
+  flow_marker_ids_to_retain = nearest_flow_markers$flow_id |> 
+    map( ~ {
+      
+      flow_to_test = nearest_flow_markers[nearest_flow_markers$flow_id == .x,]
+      
+      start_point = flow_to_test |> 
+        st_cast("POINT", warn = F) |>
+        group_by(flow_id) |> 
+        slice(1)
+      
+      start_point |> 
+        st_join(flow_seed, st_intersects) |> 
+        filter(!is.na(name))
+    }) |> 
+    bind_rows() |> 
+    dplyr::pull(flow_id)
+  
+  nearest_flow_markers[nearest_flow_markers$flow_id %in% flow_marker_ids_to_retain,]
+  
+  ggplot() + 
+    geom_sf(data = wbs_after_difference) + 
+    geom_sf(data = flow_seed, fill = 'darkblue') + 
+    geom_sf(data = nearest_flow_markers)
+  
+  for(id in nearest_flow_markers$flow_id){
+    
+    # Get coordinates of end of this flow line...
+    flow_line_ends = nearest_flow_markers |> 
+      filter(flow_id == id) |> 
+      st_cast("POINT", warn = F) |> 
+      slice(2)
+    
+    # # Narrow the nearest wbs to just ones that overlap with the flow line.
+    # wbs_after_difference = wbs_after_difference[unlist(st_intersects(wbs_after_difference,flow_line_ends)),]
+    
+    # Identify which of the contiguous waterbodies are closest to the end of the flow line...
+    downstream_wb = wbs_after_difference[unlist(st_nearest_feature(flow_line_ends[flow_line_ends$flow_id == id,], wbs_after_difference)),] |> 
+      mutate(name = 'flow_seed')
+
+    # Did we get a match with a downstream waterbody?
+    # If not, skip to next; if so, join to flow_seed.
+    if(st_is_empty(downstream_wb)){
+      next
+    } else {
+      # Join this waterbody to our growing 'flow seed' object.
+      flow_seed = st_make_valid(
+        bind_rows(flow_seed, downstream_wb) |> 
+          group_by(name) |> 
+          summarise()
+      )
+    }
+  }
+}
+
+ggplot() + 
+    geom_sf(data = nearest_wbs) + 
+    geom_sf(data = flow_seed, fill = 'darkblue') + 
+    geom_sf(data = nearest_flow_markers)
+```
+
 ### Waterbody 'Graph' Maps {.tabset}
 
 #### Without Elevation/Slope
@@ -245,8 +463,6 @@ my_flow_direction = terra::terrain(my_elevation, 'flowdir')
 
 # elev_pal = colorNumeric(c("#331b0e", "#359c3d", "#93ccc5"), terra::values(my_elevation),
 #   na.color = "transparent")
-
-
 ```
 
 #### With Elevation/Slope
