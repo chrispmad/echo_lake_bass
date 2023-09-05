@@ -1,0 +1,280 @@
+---
+title: "Leaflet legend cutting of"
+author: "Chris Madsen"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = F)
+
+library(tidyverse)
+library(ggspatial)
+library(bcdata)
+library(sf)
+library(leaflet)
+library(rasterbc)
+```
+
+```{r options, include = F}
+dist_from_wb_to_search = 10 # This number is in kilometers
+
+buffer_size_in_m = 50
+
+elevation_threshold = 10 # meters.
+
+slope_threshold = 5 # this number is in degrees.
+
+invasive_species = 'smallmouth_bass'
+
+invasive_species_label = stringr::str_to_title(stringr::str_replace(invasive_species,'_',' '))
+
+focus_wb = 'Echo Lake'
+
+focus_wb_code_name = stringr::str_to_lower(stringr::str_replace(focus_wb, ' ','_'))
+
+focus_graph_name = paste0(stringr::str_extract(focus_wb_code_name,'^[a-z]+'),'_graph')
+
+out_folder_name = paste0(invasive_species,'_',dist_from_wb_to_search,'km_radius_',buffer_size_in_m,'_stream_buffer_',elevation_threshold,'_elev_',slope_threshold,'_slope')
+
+if(!dir.exists(paste0('output/',out_folder_name))){
+  dir.create(paste0('output/',out_folder_name))
+}
+
+file.remove(list.files(path = paste0('output/',out_folder_name), full.names = T))
+```
+
+# `r focus_wb` - Waterbody Connectivity
+
+## Parameters of Assessment
+
+- This run is for `r invasive_species_label`, with `r focus_wb` as the source waterbody.
+- The search radius around `r focus_wb` is `r dist_from_wb_to_search` km.
+- Dispersal of the species is deemed possible if the change in elevation AND/OR slope between two waterbodies is less than or equal to `r elevation_threshold` / `r slope_threshold` respectively.
+- Waterbodies are buffered by `r buffer_size_in_m` to facilitate identifying overlaps that otherwise might not be identified due to slight errors in stream/river/lake polygon extents.
+
+```{r which_wb_is_ours}
+# ws = read_sf("W:/CMadsen/shared_data_sets/WatershedGroups_lowres.shp") |> select(WATERSHE_1)
+# 
+# echo_lakes = bcdc_query_geodata('freshwater-atlas-lakes') |>
+#   filter(GNIS_NAME_1 == 'Echo Lake') |>
+#   collect()
+
+# # Join to watersheds to see which is on vancouver island.
+# 
+# echo_lakes |>
+#   st_join(ws, st_intersects) |> View()
+```
+
+```{r get_wb_polygon}
+focus_wb_poly = bcdc_query_geodata('freshwater-atlas-lakes') |> 
+  filter(GNIS_NAME_1 == focus_wb,
+         WATERSHED_GROUP_ID == 20) |> 
+  collect()
+```
+
+## `r focus_wb`
+
+### First Glance {.tabset}
+
+#### Leaflet map
+
+```{r}
+centroid_points = as.data.frame(st_centroid(focus_wb_poly) |> st_transform(crs = 4326) |> st_coordinates())
+
+leaflet() |> 
+  addTiles() |> 
+  addPolygons(
+    fillColor = 'darkblue',
+    label = ~GNIS_NAME_1,
+    data = focus_wb_poly |> sf::st_transform(4326)
+  ) |> 
+  addScaleBar('bottomright') |> 
+  setView(lng = centroid_points$X, lat = centroid_points$Y, zoom = 14)
+```
+
+#### Nearby lakes, rivers and streams
+
+```{r get_watershed_atlas}
+
+# Get all lake/stream/river polygons within X kilometers, depending on the
+# options we wrote above.
+nlakes = bcdc_query_geodata('freshwater-atlas-lakes') |> 
+  filter(DWITHIN(focus_wb_poly, dist_from_wb_to_search, 'kilometers')) |> collect()
+
+nstreams = bcdc_query_geodata('freshwater-atlas-stream-network') |>
+  filter(DWITHIN(focus_wb_poly, dist_from_wb_to_search, 'kilometers')) |> 
+  # filter(FEATURE_SOURCE != 'lake-def skelet') |> 
+  collect() 
+
+# # Remove stream lines that are actually lake defining skeletons 
+# # or have 'River' in the name.
+# nstreams = nstreams |>
+#   filter(FEATURE_SOURCE != 'lake-def skelet') |> 
+#   filter(!stringr::str_detect(GNIS_NAME,'River$'))
+
+nrivers = bcdc_query_geodata('freshwater-atlas-rivers') |>
+  filter(DWITHIN(focus_wb_poly, dist_from_wb_to_search, 'kilometers')) |> collect()
+```
+
+```{r simplify columns and join together into graphs.}
+nlakes = nlakes |> 
+  dplyr::mutate(polytype = 'lake') |> 
+  dplyr::select(name = GNIS_NAME_1, polytype)
+
+nrivers = nrivers |> 
+  dplyr::mutate(polytype = 'river') |> 
+  dplyr::select(name = GNIS_NAME_1, polytype)
+
+nstreams = nstreams |> 
+  dplyr::mutate(polytype = 'stream') |> 
+  dplyr::select(name = GNIS_NAME, polytype)
+
+# Buffer everything by 10 meters so that slight overlaps are almost guaranteed - we need these to carry out a spatial union.
+nlakes = st_buffer(nlakes, buffer_size_in_m)
+nrivers = st_buffer(nrivers, buffer_size_in_m)
+nstreams = st_buffer(nstreams, buffer_size_in_m)
+
+wbs = nlakes |> 
+  bind_rows(nrivers, nstreams)
+
+wbs = wbs |>
+  dplyr::select(name,
+                polytype)
+
+### Leaflet map of all waterbodies within `r dist_from_echo_lake_to_search` km of `r focus_wb`
+```
+
+```{r leaflet_of_all_wbs}
+
+ids_for_leaf = paste0(wbs$name, " (",wbs$polytype,')')
+ids_for_leaf = str_replace_all(ids_for_leaf, "^NA", "nameless")
+
+leaflet() |> 
+  addTiles() |> 
+  addPolygons(
+    color = ~case_when(name == focus_wb ~ 'red',
+                       is.na(name) ~ 'blue',
+                       T ~ 'blue'),
+    fillColor = ~case_when(name == focus_wb ~ 'red',
+                           is.na(name) ~ 'blue',
+                           T ~ 'blue'),
+    fillOpacity = ~case_when(name == focus_wb ~ 1,
+                             is.na(name) ~ 0.5,
+                             T ~ 0.5),
+    label = ids_for_leaf,
+    data = wbs |> st_transform(crs = 4326)
+  ) |> 
+  addScaleBar('bottomright')
+```
+
+### Waterbody 'Graph' Maps {.tabset}
+
+#### Without Elevation/Slope
+
+```{r leaflet_of_graphs}
+parts = st_cast(st_union(wbs),"POLYGON")
+
+clust = unlist(st_intersects(wbs, parts))
+
+wbs$graph_id = clust
+
+wbs = st_transform(wbs, 4326)
+
+# wbs |> 
+#   st_drop_geometry() |> 
+#   count(graph_id, sort = T)
+# Mostly in graph 1.
+# Let's put all graphs past graph ID 6 as "Other"
+
+wbs_f = wbs |> 
+  mutate(graph_id = as.factor(graph_id)) |> 
+  mutate(graph_id = forcats::fct_lump(graph_id, n = 6))
+
+wbs_s = wbs_f |> 
+  group_by(graph_id) |> 
+  summarise()
+
+my_pal = colorFactor(palette = 'Spectral',
+                     domain = unique(wbs_f$graph_id))
+
+leaflet() |>
+  addProviderTiles(providers$CartoDB) |>
+  addPolygons(
+    fillOpacity = 0,
+    color = 'yellow',
+    opacity = 1,
+    weight = 5,
+    label = ~name,
+    data = nngeo::st_remove_holes(wbs |> filter(name == focus_wb))
+  ) |> 
+  addPolygons(
+    color = 'black',
+    weight = 1.5,
+    fillColor = ~my_pal(graph_id),
+    fillOpacity = 0.8,
+    label = ~paste0("Graph: ",graph_id),
+    data = wbs_s
+  ) |>
+  addScaleBar('bottomright') |> 
+  addLegend(pal = my_pal,
+            title = 'Graph ID',
+            values = wbs_s$graph_id)
+```
+
+```{r adding_elevation_to_leaflet, include=F,message=F,results='hide'}
+# Get elevation for this area.
+my_bbox = st_as_sfc(st_bbox(wbs_s))
+
+# rasterbc::listdata_bc()
+# datadir_bc('C:/Users/CMADSEN/Downloads/LocalR/echo_lake_bass/data/', quiet=TRUE)
+
+# getdata_bc(geo=my_bbox, collection='dem', varname='slope')
+
+# terra::rast(tif.path)
+
+my_elevation <- elevatr::get_elev_raster(locations = my_bbox, z = 9, clip = "locations")
+
+my_slope = terra::terrain(my_elevation, opt = 'slope', units = 'degrees')
+
+# Not using flow yet. But could be useful!
+my_flow_direction = terra::terrain(my_elevation, 'flowdir')
+
+# elev_pal = colorNumeric(c("#331b0e", "#359c3d", "#93ccc5"), terra::values(my_elevation),
+#   na.color = "transparent")
+
+
+```
+
+#### With Elevation/Slope
+
+```{r leaflet_of_slope_and_elevation}
+elev_pal = colorNumeric(c("darkgreen", "#359c3d", "yellow","red","white"), terra::values(my_elevation),
+  na.color = "transparent")
+
+slope_pal <- colorNumeric(c("#000340", "#bdc0ff"), terra::values(my_slope),
+  na.color = "transparent")
+
+leaflet() |> 
+  addProviderTiles(providers$CartoDB, group = 'CartoDB') |> 
+  addPolygons(
+    color = 'black',
+    weight = 2,
+    fillColor = ~my_pal(graph_id),
+    fillOpacity = 0.6,
+    label = ~paste0("Graph: ",graph_id),
+    data = wbs_s
+  ) |> 
+    addRasterImage(group = 'elevation', my_elevation, colors = elev_pal, opacity = 0.4) |>
+    addRasterImage(group = 'slope', my_slope, colors = slope_pal, opacity = 0.8) |> 
+  addLayersControl(baseGroups = 'CartoDB',
+                   overlayGroups = c("elevation","slope"),
+                  options = layersControlOptions(collapsed = F)) |> 
+  addPolygons(
+    fillColor = 'green',
+    fillOpacity = 0.8,
+    color = 'green',
+    label = ~name,
+    data = wbs |> filter(name == focus_wb)
+  )
+```
