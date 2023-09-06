@@ -24,10 +24,6 @@ dist_from_wb_to_search = 10 # This number is in kilometers
 
 buffer_size_in_m = 50
 
-elevation_threshold = 5 # meters.
-
-slope_threshold = 5 # this number is in degrees.
-
 invasive_species = 'smallmouth_bass'
 
 invasive_species_label = stringr::str_to_title(stringr::str_replace(invasive_species,'_',' '))
@@ -55,19 +51,6 @@ file.remove(list.files(path = paste0('output/',out_folder_name), full.names = T)
 - The search radius around `r focus_wb` is `r dist_from_wb_to_search` km.
 - Dispersal of the species is deemed possible if the change in elevation AND/OR slope between two waterbodies is less than or equal to `r elevation_threshold` / `r slope_threshold` respectively.
 - Waterbodies are buffered by `r buffer_size_in_m` to facilitate identifying overlaps that otherwise might not be identified due to slight errors in stream/river/lake polygon extents.
-
-```{r which_wb_is_ours}
-# ws = read_sf("W:/CMadsen/shared_data_sets/WatershedGroups_lowres.shp") |> select(WATERSHE_1)
-# 
-# echo_lakes = bcdc_query_geodata('freshwater-atlas-lakes') |>
-#   filter(GNIS_NAME_1 == 'Echo Lake') |>
-#   collect()
-
-# # Join to watersheds to see which is on vancouver island.
-# 
-# echo_lakes |>
-#   st_join(ws, st_intersects) |> View()
-```
 
 ```{r get_wb_polygon}
 focus_wb_poly = bcdc_query_geodata('freshwater-atlas-lakes') |> 
@@ -107,14 +90,7 @@ nlakes = bcdc_query_geodata('freshwater-atlas-lakes') |>
 
 nstreams = bcdc_query_geodata('freshwater-atlas-stream-network') |>
   filter(DWITHIN(focus_wb_poly, dist_from_wb_to_search, 'kilometers')) |> 
-  # filter(FEATURE_SOURCE != 'lake-def skelet') |> 
   collect() 
-
-# # Remove stream lines that are actually lake defining skeletons 
-# # or have 'River' in the name.
-# nstreams = nstreams |>
-#   filter(FEATURE_SOURCE != 'lake-def skelet') |> 
-#   filter(!stringr::str_detect(GNIS_NAME,'River$'))
 
 nrivers = bcdc_query_geodata('freshwater-atlas-rivers') |>
   filter(DWITHIN(focus_wb_poly, dist_from_wb_to_search, 'kilometers')) |> collect()
@@ -138,8 +114,56 @@ nlakes = st_buffer(nlakes, buffer_size_in_m)
 nrivers = st_buffer(nrivers, buffer_size_in_m)
 nstreams = st_buffer(nstreams, buffer_size_in_m)
 
+```
+
+```{r trim_lake_skeleton_pieces_from_streams_layer}
+
+# First step: which streams overlap with a lake? The following rows:
+row_lakes_int_streams = as.numeric(
+  unlist(
+    as.character(
+      st_intersects(
+        nstreams,
+        nlakes
+      )
+    )
+  )
+)
+
+
+# Remove streams that are actually 'lake skeletons' and are completely 
+# covered by a lake.
+nstreams_to_draw_from_trimmed = map(1:nrow(nstreams), ~ {
+  # This stream doesn't overlap with any lake. Don't touch it!
+  if(is.na(row_lakes_int_streams[.x])){
+    stream_out = nstreams[.x,]
+  } else {
+    stream_minus_lake = st_difference(nstreams[.x,],
+                                      dplyr::select(
+                                        nlakes[row_lakes_int_streams[.x],],
+                                        geometry)
+    )
+    
+    # If there's still a tiny fraction of a stream, but it's super duper small,
+    # just delete it.
+    if(nrow(stream_minus_lake) > 0){
+      if(as.numeric(st_area(stream_minus_lake)) < 10){
+        return(NULL)
+      }
+    }
+    
+    stream_out = st_buffer(stream_minus_lake,1) # Rebuffer by 1 meter, just to 
+    # guarantee spatial overlap with the lakes we clipped these suckers.
+    
+  }
+  stream_out
+}) |> bind_rows()
+
+```
+
+```{r join_freshwater_atlas_layers_together}
 wbs = nlakes |> 
-  bind_rows(nrivers, nstreams)
+  bind_rows(nrivers, nstreams_to_draw_from_trimmed)
 
 wbs = wbs |>
   dplyr::select(name,
@@ -172,6 +196,8 @@ leaflet() |>
 ```
 
 ### Downstream Waterbodies from `r focus_wb` {.tabset}
+
+We need to trace a course from `r focus_wb` through following the direction of flow through contiguous streams and lakes.
 
 #### Map of all Stream Direction Markers
 ```{r}
@@ -245,14 +271,14 @@ ggplot() +
   geom_sf(data = nearby_stream_flow_lines,
           col = 'black',
           arrow = arrow(length = unit(0.25, 'cm'))) + 
-  geom_point(
-    aes(x = X, y = Y),
-    col = 'black',
-    data = nearby_stream_flow_lines |> 
-      st_coordinates() |> 
-      as.data.frame() |> 
-      group_by(L1) |> 
-      slice(2)) +
+  # geom_point(
+  #   aes(x = X, y = Y),
+  #   col = 'black',
+  #   data = nearby_stream_flow_lines |> 
+  #     st_coordinates() |> 
+  #     as.data.frame() |> 
+  #     group_by(L1) |> 
+  #     slice(2)) +
   geom_sf_text(
     aes(label = id),
     data = demo_flow_wbs |> filter(id == focus_wb)
@@ -266,8 +292,9 @@ ggplot() +
 
 ```{r}
 # Keep this running until something causes us to escape the loop.
-for(i in 1:17){
+for(i in 1:30){
   
+  # i = i + 1
   if(interactive()) print(i)
   
   if(i == 1){
@@ -286,11 +313,14 @@ for(i in 1:17){
     filter(!name %in% c(focus_wb,'flow_seed') | is.na(name)) |> 
     mutate(row_id = row_number())
   
-  # No more wbs that are touching our 
-  if(nrow(nearest_wbs)){break}
+  ggplot() + geom_sf(data = flow_seed, fill = 'darkblue') + 
+    geom_sf(data = nearest_wbs, fill = 'lightblue')
+  
+  # No more wbs that are touching our flow_seed? Break!
+  if(nrow(nearest_wbs) == 0){break}
   
   # And remove these nearest waterbodies from our table of waterbodies to draw from...
-  wb_pool_to_draw_from = wb_pool_to_draw_from[-unlist(st_intersects(flow_seed,wb_pool_to_draw_from)),]
+  wb_pool_to_draw_from = wb_pool_to_draw_from[-unlist(st_intersects(st_buffer(flow_seed,20),wb_pool_to_draw_from)),]
   
   # Are there any lakes in the nearest_wbs? If so, 
   # we need to elide any streams that act as lake
@@ -322,11 +352,16 @@ for(i in 1:17){
     wbs_after_difference = nearest_wbs
   }
   
-  # Find the nearest flow markers within 10 meters of our focus wb.
-  nearest_flow_markers = flow_lines_to_draw_from[unlist(st_is_within_distance(flow_seed, flow_lines_to_draw_from, dist = 10)),]
+  # Find the nearest flow markers within 50 meters of our focus wb.
+  nearest_flow_markers = flow_lines_to_draw_from[unlist(st_is_within_distance(flow_seed, flow_lines_to_draw_from, dist = 50)),]
+  
+  ggplot() + 
+    geom_sf(data = flow_seed, fill = 'darkblue') + 
+    geom_sf(data = wbs_after_difference, fill = 'lightblue') + 
+    geom_sf(data = nearest_flow_markers)
   
   # Remove these nearest flow markers from the list of flow markers to search in subsequent model iterations.
-  flow_lines_to_draw_from = flow_lines_to_draw_from[-unlist(st_is_within_distance(flow_seed, flow_lines_to_draw_from, dist = 10)),]
+  flow_lines_to_draw_from = flow_lines_to_draw_from[-unlist(st_is_within_distance(flow_seed, flow_lines_to_draw_from, dist = 50)),]
   
   # Retain only flow lines whose start point fall within our flow_seed.
   flow_marker_ids_to_retain = nearest_flow_markers$flow_id |> 
@@ -346,12 +381,39 @@ for(i in 1:17){
     bind_rows() |> 
     dplyr::pull(flow_id)
   
-  nearest_flow_markers[nearest_flow_markers$flow_id %in% flow_marker_ids_to_retain,]
+  nearest_flow_markers = nearest_flow_markers[nearest_flow_markers$flow_id %in% flow_marker_ids_to_retain,]
   
   ggplot() + 
     geom_sf(data = wbs_after_difference) + 
     geom_sf(data = flow_seed, fill = 'darkblue') + 
     geom_sf(data = nearest_flow_markers)
+  
+  # Drop any markers that only touch the flow_seed.
+  flow_marker_ids_to_retain = nearest_flow_markers$flow_id |> 
+    map( ~ {
+      
+      flow_to_test = nearest_flow_markers[nearest_flow_markers$flow_id == .x,]
+      
+      # flow_direction_points = flow_to_test |> 
+      #   st_cast("POINT", warn = F)
+      
+      non_flow_overlap_test = flow_to_test |> 
+        st_join(
+          bind_rows(flow_seed,
+                    wbs_after_difference |> 
+                      mutate(name = 'not_flow_seed')),
+          st_intersects) |> 
+        filter(!is.na(name)) |> 
+        filter(name != 'flow_seed')
+      
+      if(nrow(non_flow_overlap_test) > 0){
+        return(flow_to_test)
+      }
+    }) |> 
+    bind_rows() |> 
+    dplyr::pull(flow_id)
+  
+  nearest_flow_markers = nearest_flow_markers[nearest_flow_markers$flow_id %in% flow_marker_ids_to_retain,]
   
   for(id in nearest_flow_markers$flow_id){
     
@@ -363,6 +425,11 @@ for(i in 1:17){
     
     # # Narrow the nearest wbs to just ones that overlap with the flow line.
     # wbs_after_difference = wbs_after_difference[unlist(st_intersects(wbs_after_difference,flow_line_ends)),]
+    
+    ggplot() + 
+      geom_sf(data = flow_seed, fill = 'darkblue') +
+      geom_sf(data = wbs_after_difference, fill = 'lightblue') + 
+      geom_sf(color = 'red',data = nearest_flow_markers[nearest_flow_markers$flow_id == id,])
     
     # Identify which of the contiguous waterbodies are closest to the end of the flow line...
     downstream_wb = wbs_after_difference[unlist(st_nearest_feature(flow_line_ends[flow_line_ends$flow_id == id,], wbs_after_difference)),] |> 
@@ -389,197 +456,7 @@ ggplot() +
     geom_sf(data = nearest_flow_markers)
 ```
 
-### Waterbody 'Graph' Maps {.tabset}
 
-#### Without Elevation/Slope
-
-```{r leaflet_of_graphs}
-parts = st_cast(st_union(wbs),"POLYGON")
-
-clust = unlist(st_intersects(wbs, parts))
-
-wbs$graph_id = clust
-
-wbs = st_transform(wbs, 4326)
-
-# wbs |> 
-#   st_drop_geometry() |> 
-#   count(graph_id, sort = T)
-# Mostly in graph 1.
-# Let's put all graphs past graph ID 6 as "Other"
-
-wbs_f = wbs |> 
-  mutate(graph_id = as.factor(graph_id)) |> 
-  mutate(graph_id = forcats::fct_lump(graph_id, n = 6))
-
-wbs_s = wbs_f |> 
-  group_by(graph_id) |> 
-  summarise()
-
-my_pal = colorFactor(palette = 'Spectral',
-                     domain = unique(wbs_f$graph_id))
-
-leaflet() |>
-  addProviderTiles(providers$CartoDB) |>
-  addPolygons(
-    fillOpacity = 0,
-    color = 'yellow',
-    opacity = 1,
-    weight = 5,
-    label = ~name,
-    data = nngeo::st_remove_holes(wbs |> filter(name == focus_wb))
-  ) |> 
-  addPolygons(
-    color = 'black',
-    weight = 1.5,
-    fillColor = ~my_pal(graph_id),
-    fillOpacity = 0.8,
-    label = ~paste0("Graph: ",graph_id),
-    data = wbs_s
-  ) |>
-  addScaleBar('bottomright') |> 
-  addLegend(pal = my_pal,
-            title = 'Graph ID',
-            values = wbs_s$graph_id)
-```
-
-```{r adding_elevation_to_leaflet, include=F,message=F,results='hide'}
-# Get elevation for this area.
-my_bbox = st_as_sfc(st_bbox(wbs_s))
-
-# rasterbc::listdata_bc()
-# datadir_bc('C:/Users/CMADSEN/Downloads/LocalR/echo_lake_bass/data/', quiet=TRUE)
-
-# getdata_bc(geo=my_bbox, collection='dem', varname='slope')
-
-# terra::rast(tif.path)
-
-my_elevation <- elevatr::get_elev_raster(locations = my_bbox, z = 9, clip = "locations")
-
-my_slope = terra::terrain(my_elevation, opt = 'slope', units = 'degrees')
-
-# Not using flow yet. But could be useful!
-my_flow_direction = terra::terrain(my_elevation, 'flowdir')
-
-# elev_pal = colorNumeric(c("#331b0e", "#359c3d", "#93ccc5"), terra::values(my_elevation),
-#   na.color = "transparent")
-```
-
-#### With Elevation/Slope
-
-```{r leaflet_of_slope_and_elevation}
-elev_pal = colorNumeric(c("darkgreen", "#359c3d", "yellow","red","white"), terra::values(my_elevation),
-  na.color = "transparent")
-
-slope_pal <- colorNumeric(c("#000340", "#bdc0ff"), terra::values(my_slope),
-  na.color = "transparent")
-
-leaflet() |> 
-  addProviderTiles(providers$CartoDB, group = 'CartoDB') |> 
-  addPolygons(
-    color = 'black',
-    weight = 2,
-    fillColor = ~my_pal(graph_id),
-    fillOpacity = 0.6,
-    label = ~paste0("Graph: ",graph_id),
-    data = wbs_s
-  ) |> 
-    addRasterImage(group = 'elevation', my_elevation, colors = elev_pal, opacity = 0.4) |>
-    addRasterImage(group = 'slope', my_slope, colors = slope_pal, opacity = 0.8) |> 
-  addLayersControl(baseGroups = 'CartoDB',
-                   overlayGroups = c("elevation","slope"),
-                  options = layersControlOptions(collapsed = F)) |> 
-  addPolygons(
-    fillColor = 'green',
-    fillOpacity = 0.8,
-    color = 'green',
-    label = ~name,
-    data = wbs |> filter(name == focus_wb)
-  )
-```
-
-```{r}
-# For our lakes, overlay them with wbs to assign them a graph_id
-nlakes_w_graph = nlakes |> 
-  st_transform(crs = 4326) |> 
-  st_join(wbs_s, st_intersects)
-
-nstreams_w_graph = nstreams |> 
-  st_transform(crs = 4326) |> 
-  st_join(wbs_s, st_intersects)
-```
-
-```{r calulate_elevation_and_slope, include=F, results = 'hide'}
-
-# Find average elevation for each wb
-library(exactextractr)
-lake_elevs = exact_extract(terra::rast(my_elevation), nlakes_w_graph)
-stream_elevs = exact_extract(terra::rast(my_elevation), nstreams_w_graph)
-
-lake_slopes = exact_extract(terra::rast(my_slope), nlakes_w_graph)
-stream_slopes = exact_extract(terra::rast(my_slope), nstreams_w_graph)
-
-nlakes_w_graph$elevation = sapply(lake_elevs, \(x) mean(x[,1]*x[,2]))
-nstreams_w_graph$elevation = sapply(stream_elevs, \(x) mean(x[,1]*x[,2]))
-
-nlakes_w_graph$slope = sapply(lake_slopes, \(x) mean(x[,1]*x[,2]))
-nstreams_w_graph$slope = sapply(stream_slopes, \(x) mean(x[,1]*x[,2]))
-```
-
-```{r mean_elevation_ggplot, fig.width=6,fig.height=6}
-# Now arrange waterbodies for each graph
-ggplot() + 
-  geom_sf(data = nstreams_w_graph, aes(fill = elevation),col = 'transparent') + 
-  geom_sf(data = nlakes_w_graph, aes(fill = elevation),col = 'transparent') + 
-  scale_fill_gradient2(low = 'darkgreen', mid = 'yellow', high = 'red', midpoint = median(nlakes_w_graph$elevation)) + 
-  ggthemes::theme_map() + 
-  labs(title = 'Mean elevation by lake/river/stream')
-```
-
-### Possible `r stringr::str_to_title(stringr::str_replace(invasive_species,'_',' '))` Spread from `r focus_wb`
-
-Which lakes in the same graph as `r focus_wb` could be accessible in terms of elevation change / slope? These lakes could be at higher risk of aquatic invasive species spread.
-
-This run of the analysis assumes that invasive species spread could be possible at an elevation threshold of `r elevation_threshold` meters and/or a slope of up to `r slope_threshold` degrees between a hypothetical 'source' waterbody (i.e. lake or stream that is physically accessible from `r focus_wb`) and a hypothetical 'destination' waterbody (any waterbody physically connected to the 'source' waterbody).
-
-```{r find_the_graph_and_sort_elevs}
-
-focus_wb_graph_id = nlakes_w_graph |> filter(name == focus_wb) |> dplyr::pull(graph_id)
-
-focus_wb_lake_elev = nlakes_w_graph |> filter(name == focus_wb) |> dplyr::pull(elevation)
-
-focus_graph_l = nlakes_w_graph |> 
-  filter(graph_id == focus_wb_graph_id) |> 
-  mutate(elev_below = elevation < (focus_wb_lake_elev  + 10))
-
-focus_graph_s = nstreams_w_graph |> 
-  filter(graph_id == nlakes_w_graph |> filter(name == focus_wb) |> dplyr::pull(graph_id)) |> 
-  mutate(elev_below = elevation < (focus_wb_lake_elev + 10))
-```
-
-```{r elev_less_than_focus_wb_plus_10_m}
-cols <- c('TRUE' = "orange", "FALSE" = "white")
-# alphas = c('TRUE' = 0.8, "FALSE" = 0.2)
-
-focus_graph_s_not_in_lakes = st_join(focus_graph_s, nlakes_w_graph |> mutate(lake = 'lake overlapping') |> dplyr::select(lake)) |> 
-  filter(is.na(lake))
-
-ggplot() + 
-  # geom_sf(data = echo_graph_s, aes(fill = elev_below, alpha = elev_below)) +
-  geom_sf(data = focus_graph_s, aes(fill = elev_below)) +
-  geom_sf(data = focus_graph_l, aes(fill = elev_below)) + 
-  labs(fill = 'Invasive Sp. \nSpread Possible') + 
-  scale_fill_manual(values = cols)
-```
-
-```{r use_lakes_higher_than_focus_wb_to_trim_streams}
-# These lakes are above our focus wb.
-tall_lakes = focus_graph_l |> 
-  filter(elev_below == FALSE) |> 
-  dplyr::select(elev_below)
-```
-
-We need to trace a course from `r focus_wb` through streams and lakes, only continuing when the next waterbody has an elevation at most `r elevation_threshold` m / `r slope_threshold` degrees (slope) higher than the one before...
 
 ### Invasibility Results {.tabset}
 ```{r the_big_cheese}
